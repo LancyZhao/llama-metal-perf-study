@@ -2,7 +2,7 @@
 
 A measurement-driven performance-engineering case study: build llama.cpp's Metal backend from source on an Apple M2, establish a reproducible baseline, then take three plausible "this looks optimizable" ideas, turn each into a hypothesis, run an isolated experiment, and let the data decide — explaining *why* there is no room in each case.
 
-> **Bottom line:** llama.cpp's Metal backend is already up against the hardware limits on an M2. All three optimization hypotheses were falsified by their own measurements — and the *way* they were falsified (microbenchmarks, A/B tests, correctness checks, bottleneck attribution) is the point of this project: **measure, locate the bottleneck, and never ship a fake win.**
+> **Bottom line:** llama.cpp's Metal backend is already up against the hardware limits on an M2. Three optimization hypotheses were falsified by their own measurements, and a fourth probe located the one regime with headroom left (long-context attention) — and the *way* they were tested (microbenchmarks, A/B tests, correctness checks, bottleneck attribution) is the point of this project: **measure, locate the bottleneck, and never ship a fake win.**
 
 *(中文版见 [README.zh-CN.md](README.zh-CN.md))*
 
@@ -76,6 +76,21 @@ soa_memcpy (ideal SoA)            ~9  µs/step   <- 3.2x faster
 ```
 
 **Result.** B=2 **drops from 53.2 to 42.7 tok/s (−20 %)**, output byte-identical (correct but slower). That ext kernel is slower for K-quants at ne11=2/3 than the MMA path it currently takes — **upstream's `≥ 4` gate is the right call**, and the B=1→2 cliff is a deliberate, correct routing decision, not a bug. **Dropped.**
+
+## A lead worth noting — long-context attention (not yet confirmed)
+
+Unlike the three dead ends, this one shows *unused* bandwidth. Throughput vs KV depth:
+
+| KV depth | decode tg128 | prefill pp512 |
+|---|---|---|
+| 0 | 42.2 | 433 |
+| 2048 | 38.6 | 387 |
+| 4096 | 36.2 | 349 |
+| 8192 | 32.4 (−23 %) | 294 (−32 %) |
+
+The slowdown is expected (attention grows with context); the roofline is the interesting part. Short-context decode runs at ~80 GB/s (82 % of peak). At 8K the KV cache adds only ~0.3 GB/token, so a pure-bandwidth model predicts ~36 tok/s — but it measures **32.4**: achieved bandwidth has fallen to **~71 GB/s**. The attention / KV-read path is *not* saturating memory bandwidth the way the weight GEMV does. That gap is the one place in this study with plausible headroom — and it is the regime that matters in practice (long prompts, RAG, chat).
+
+**Honest caveat:** confirming it, and landing a win, needs per-op GPU profiling (unavailable here without the Xcode Metal GPU-capture toolchain) or direct work on the `fa_*` FlashAttention kernels — expert territory, unknown odds. What separates this from the three dead ends: here the data shows bandwidth left on the table, not a hypothesis the data rejected.
 
 ## So where *is* there headroom?
 

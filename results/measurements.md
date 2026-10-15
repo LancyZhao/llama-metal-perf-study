@@ -67,3 +67,19 @@ Lowering the K-quant small-batch mat-vec gate to `ne11 ≥ 2` (upstream uses `�
 
 Generation byte-identical (numerically correct), but B=2 **regresses 20 %** →
 upstream's `≥ 4` gate is already the right routing choice for K-quants.
+
+## Long-context scaling (lead, not yet confirmed) — `llama-bench -d 0,512,2048,4096,8192`
+| KV depth | decode tg128 t/s | prefill pp512 t/s |
+|---|---|---|
+| 0 | 42.17 ± 0.33 | 433.42 ± 1.89 |
+| 512 | 39.34 ± 1.66 | 420.31 ± 3.95 |
+| 2048 | 38.60 ± 1.20 | 386.89 ± 2.37 |
+| 4096 | 36.16 ± 0.68 | 349.34 ± 1.48 |
+| 8192 | 32.43 ± 0.95 | 294.48 ± 1.19 |
+
+Roofline: at d=0, decode achieves 42.2 × 1.93 ≈ **80 GB/s**. At d=8192 the KV
+cache adds ≈ 0.30 GB/token (36 layers × 2 × 2 KV heads × 128 × 2 B × 8192), so a
+pure 80 GB/s model predicts 80/(1.93+0.30) ≈ **36 t/s** — but it measures **32.4**,
+i.e. achieved bandwidth fell to ≈ **71 GB/s**. The attention / KV-read path is not
+saturating bandwidth the way the weight GEMV does → the one place with plausible
+headroom. Confirming needs per-op GPU profiling (unavailable here) or `fa_*` kernel work.
