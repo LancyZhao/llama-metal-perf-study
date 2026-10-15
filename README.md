@@ -1,103 +1,105 @@
-# llama.cpp 在 Apple Silicon 上的推理性能调查
+# llama.cpp inference performance study on Apple Silicon
 
-一次 measurement-driven 的性能工程案例:在 Apple M2 上把 llama.cpp 的 Metal 推理从头跑通、建立可复现基线,然后对三个"看起来能优化"的点逐一提出假设、做隔离实验、用数据证伪——并讲清每一个"为什么没有空间"。
+A measurement-driven performance-engineering case study: build llama.cpp's Metal backend from source on an Apple M2, establish a reproducible baseline, then take three plausible "this looks optimizable" ideas, turn each into a hypothesis, run an isolated experiment, and let the data decide — explaining *why* there is no room in each case.
 
-> **一句话结论**:llama.cpp 的 Metal 后端在 M2 上已经贴着硬件极限。三个优化假设全部被自己的数据否掉,而"否掉"的过程(微基准 / A-B / 正确性验证 / 瓶颈归因)正是本项目要展示的东西——**会测量、懂瓶颈、不发假 win**。
+> **Bottom line:** llama.cpp's Metal backend is already up against the hardware limits on an M2. All three optimization hypotheses were falsified by their own measurements — and the *way* they were falsified (microbenchmarks, A/B tests, correctness checks, bottleneck attribution) is the point of this project: **measure, locate the bottleneck, and never ship a fake win.**
 
-## 为什么是这样一个项目
+*(中文版见 [README.zh-CN.md](README.zh-CN.md))*
 
-性能优化的真实工作不是"我把它改快了",而是"我能证明时间花在哪、哪里还有空间、哪里没有"。在一个被反复打磨过的推理引擎上,好拿的分早被代码或操作系统拿走了;能诚实地量出这一点并说清机制,比再做一个"变快 demo"更接近真实的 infra / perf 工程。
+## Why this project
 
-本仓库完全可复现:基线用 `bench/run_bench.sh`,三个实验各自独立可跑,原始数据见 [`results/measurements.md`](results/measurements.md)。
+Real performance work isn't "I made it faster" — it's "I can prove where the time goes, where there's headroom, and where there isn't." On a mature, heavily-tuned inference engine the easy wins are already taken by the code or the OS; honestly measuring that and explaining the mechanism is closer to real infra/perf engineering than shipping another "it got faster" demo.
 
-## 环境与方法
+Everything here is reproducible: `bench/run_bench.sh` for the baseline, each experiment runs standalone. Raw data in [`results/measurements.md`](results/measurements.md).
+
+## Setup
 
 | | |
 |---|---|
-| 机器 | Apple M2(4P+4E / 16GB 统一内存),macOS 15.6,Metal 3 |
-| 引擎 | llama.cpp `@3e390af`,`-DGGML_METAL=ON` Release,Apple clang 17 |
-| 模型 | Qwen2.5-3B-Instruct-Q4_K_M,1.93GB,vocab 151,936 |
-| 测量 | `llama-bench`(前向吞吐)· `llama-batched-bench`(并发)· 自写微基准(采样)· `llama-cli` 墙钟(冷启动) |
+| Machine | Apple M2 (4P+4E / 16 GB unified memory), macOS 15.6, Metal 3 |
+| Engine  | llama.cpp `@3e390af`, `-DGGML_METAL=ON` Release, Apple clang 17 |
+| Model   | Qwen2.5-3B-Instruct-Q4_K_M, 1.93 GB, vocab 151,936 |
+| Tools   | `llama-bench` (forward throughput) · `llama-batched-bench` (concurrency) · a custom microbench (sampling) · `llama-cli` wall clock (cold start) |
 
-## 基线与"带宽墙"
+## Baseline and the bandwidth wall
 
-`llama-bench`(全层 offload,10 次重复,方差极小):
+`llama-bench` (all layers offloaded, 10 repetitions, tiny variance):
 
-| 场景 | t/s |
+| workload | t/s |
 |---|---|
-| 解码 tg128 | **42.7 ± 0.1** |
-| 预填 pp512 | **437.4 ± 0.9** |
-| 预填+解码 pp512+tg128 | 151.7 ± 0.5 |
+| decode tg128 | **42.7 ± 0.1** |
+| prefill pp512 | **437.4 ± 0.9** |
+| prefill+decode pp512+tg128 | 151.7 ± 0.5 |
 
-框定后面所有结论的一步:
+The one number that frames every result below:
 
-> 解码 42.7 tok/s × 模型 1.93 GB ≈ **82 GB/s ≈ M2 ~100 GB/s 带宽的 82%**。每生成 1 个 token 要把整个模型读一遍 → 解码是 **memory-bound**。推论:固定量化下,让单流解码变快的唯一物理路径是"少读权重"——要么更小的量化,要么把权重读摊到更多 token(批量 / 投机解码);compute 侧再优化都撞这堵墙。
+> decode 42.7 tok/s × 1.93 GB model ≈ **82 GB/s ≈ 82 % of the M2's ~100 GB/s**. Every generated token re-reads the whole model → decode is **memory-bandwidth bound**. Corollary: at a fixed quantization the only physical way to speed up single-stream decode is to *read the weights less* — a smaller quant, or amortizing the weight read across more tokens (batching / speculative decoding). Optimizing the compute side just hits this wall.
 
-## 实验一:采样器候选表的"去冗余"（证伪）
+## Experiment 1 — "de-duplicating" the sampler candidate array (falsified)
 
-**假设**:每生成一个 token,CPU 采样路径都把整张词表(15.2 万项)的 `{id, logit, p}` 全量重建一遍(`common/sampling.cpp` 的 `set_logits`)。`id` 恒等于下标、`p` 随后被 softmax 覆盖,只有 `logit` 真变——跳过冗余写应该更快:
+**Hypothesis.** Every generated token, the CPU sampler path rebuilds the entire vocabulary (151,936 entries) of `{id, logit, p}` in `common/sampling.cpp`'s `set_logits`. The `id` always equals the index and `p` is overwritten by softmax later, so only `logit` actually changes — skipping the redundant writes should be faster:
 
 ```diff
 -  for (token_id = 0; token_id < n_vocab; token_id++)
 -      cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-+  // id 只建一次,热路径只刷 logit
++  // write ids once; only refresh logit on the hot path
 +  if (cur_ids_n != n_vocab) { for (...) cur[i].id = i; cur_ids_n = n_vocab; }
 +  for (...) { cur[i].logit = logits[i]; cur[i].p = 0.0f; }
 ```
 
-**结果**(`bench/micro_set_logits.cpp`,5 种写法隔离微基准):改法 **慢 2.1×**。
+**Result** (`bench/micro_set_logits.cpp`, 5 layouts, isolated): the change is **2.1× slower**.
 
 ```
-full_ramp (基线整体写)   ~29 µs/step
-partial_skipid (去冗余)  ~61 µs/step   ← 慢 2.1×
-soa_memcpy (理想 SoA)    ~9  µs/step   ← 快 3.2×
+full_ramp (baseline full write)   ~29 µs/step
+partial_skipid (the "de-dup")     ~61 µs/step   <- 2.1x slower
+soa_memcpy (ideal SoA)            ~9  µs/step   <- 3.2x faster
 ```
 
-**机制**:`llama_token_data` 是 AoS(12 字节),整体顺序写能走向量化 / 流式存储;"跳过 id"变成**带空洞的部分写**(每 12 字节只写中间 8),打断顺序写、触发缓存行读-改-写。对照组 `full_cachedid`(整体写、id 从数组读)≈ 基线,证明"写 id"本就免费。真正的空间在 SoA 布局(快 3.2×),但那要重构贯穿整条采样链的 `llama_token_data_array`,是跨模块大改,且采样只占解码 **<0.2%**,端到端不可见。**放弃。**
+**Mechanism.** `llama_token_data` is an array-of-structs (12 bytes). A full sequential write vectorizes / stream-stores well; "skipping id" turns it into a **strided partial write** (8 of every 12 bytes), which breaks the sequential store and triggers cache-line read-modify-write. The control `full_cachedid` (full write, id read from an array) ≈ baseline, proving the id write was already free. The real headroom is a struct-of-arrays layout (3.2×), but that means refactoring `llama_token_data_array` across the whole sampler chain — and the sampler is **< 0.2 % of decode**, so it is invisible end-to-end. **Dropped.**
 
-## 实验二:Metal 着色器编译的冷启动（证伪）
+## Experiment 2 — Metal shader-compile cold start (falsified)
 
-**现象**:进程启动时从内嵌源码编译 35 个 Metal kernel 库,首次 **~14.2s**。
-**假设**:transformer 用不到其中一多半(ssm / wkv / conv / tri、各种量化 KV 的 flash-attn 变体),跳过能砍冷启动——加了 `GGML_METAL_SKIP_LIBS` 开关验证。
-**结果**:启动墙钟 14.2s → 6.83s → **1.1s** 一路下降,因为 **macOS 自己把编译结果缓存到磁盘**。稳态下全编(1.1s)与跳过 18 个(1.1s)**无差别**;跳过只在"刚 rebuild 后第一次"的冷缓存有用。输出逐 token 一致。
-**结论**:不是 llama.cpp 的问题,是 OS 已兜底,稳态无空间。**放弃。**
+**Observation.** On startup the backend compiles 35 Metal kernel libraries from embedded source — **~14.2 s** the first time.
+**Hypothesis.** A transformer never uses most of them (ssm / wkv / conv / tri, the quantized-KV flash-attn variants); skipping them should cut cold start. Verified with a `GGML_METAL_SKIP_LIBS` switch.
+**Result.** Startup wall fell 14.2 s → 6.83 s → **1.1 s** across successive runs, because **macOS caches compiled shaders on disk**. In steady state, compiling all 35 (1.1 s) and skipping 18 (1.1 s) are **indistinguishable**; the skip only helps the single cold compile after a rebuild. Output byte-identical.
+**Conclusion.** Not a llama.cpp problem — the OS already handles it. No steady-state headroom. **Dropped.**
 
-## 实验三:K 量化小批量 matmul 的 kernel 路由（证伪）
+## Experiment 3 — K-quant small-batch matmul routing (falsified)
 
-`llama-batched-bench` 显示并发解码从 41 t/s 扩到 227 t/s(B=16,**5.5×**)——spare compute 确实存在。但有一道反常的坎:**B=1→2 每步耗时 +57%**(本该近乎免费)。
+`llama-batched-bench` shows concurrent decode scaling from 41 to 227 tok/s (B=16, **5.5×**) — spare compute does exist. But there's one anomaly: **a +57 % per-step cost going from B=1 to B=2** (which should be nearly free).
 
-**根因**(`ggml/src/ggml-metal/ggml-metal-ops.cpp` 的 `mul_mat`):高效的小批量 mat-vec 核对传统量化(Q4_0…)开放 `ne11∈[2,8]`,但对 K 系量化(Q4_K/Q5_K/…)只开放 `[4,8]`。我们的模型是 Q4_K_M,于是 B=2/3 掉出快核:
+**Root cause** (`ggml/src/ggml-metal/ggml-metal-ops.cpp`, `mul_mat`): the efficient small-batch mat-vec kernel is enabled for legacy quants (Q4_0…) at `ne11∈[2,8]`, but for K-quants (Q4_K/Q5_K/…) only at `[4,8]`. Our model is Q4_K_M, so B=2/3 fall out of the fast kernel:
 
 ```diff
 -   false) && (ne11 >= 4 && ne11 <= 8)   // K-quants
 +   false) && (ne11 >= 2 && ne11 <= 8)
 ```
 
-**结果**:B=2 **从 53.2 掉到 42.7 t/s(−20%)**,输出逐 token 一致(正确但更慢)。那个 ext 核在 K 量化 ne11=2/3 时比它现在走的 MMA 路更慢——**上游把门槛设成 ≥4 是对的**,B=1→2 的坎是深思熟虑的正确路由,不是 bug。**放弃。**
+**Result.** B=2 **drops from 53.2 to 42.7 tok/s (−20 %)**, output byte-identical (correct but slower). That ext kernel is slower for K-quants at ne11=2/3 than the MMA path it currently takes — **upstream's `≥ 4` gate is the right call**, and the B=1→2 cliff is a deliberate, correct routing decision, not a bug. **Dropped.**
 
-## 那到底哪里还有空间?
+## So where *is* there headroom?
 
-- **并发吞吐**:已能扩 5.5×(B=16),llama.cpp 的 continuous batching 已实现且扩得不错。
-- **投机解码**:摊薄带宽成本的正解,llama.cpp 已有大量实现(`--spec-type` 多种)。
-- **解码最后的 18%**(82%→100% 带宽):要重写 Metal GEMV kernel(访存 / dequant 重叠),专家级深水区且上游已很接近——低胜率,本项目不碰。
-- **换后端**:CUDA / CPU / 国产加速卡后端未必像 M2 Metal 这样被榨干,是另一台机器的战场。
+- **Concurrent throughput** already scales 5.5× (B=16); llama.cpp's continuous batching is implemented and scales well.
+- **Speculative decoding** is the right way to amortize the bandwidth cost, and llama.cpp already ships many variants (`--spec-type`).
+- **The last 18 %** of decode (82 % → 100 % of bandwidth) needs a rewritten Metal GEMV kernel (access pattern / dequant overlap) — expert territory, and upstream is already close. Low odds; out of scope here.
+- **Other backends** (CUDA / CPU / domestic accelerators) may not be as squeezed as M2 Metal — a different machine's battle.
 
-## 这个项目展示了什么
+## What this project demonstrates
 
-- 从源码构建并读懂一个大型 C++/Objective-C/Metal 推理引擎的热路径(解码循环、采样链、Metal 派发、KV cache)
-- 建立低方差、可复现的基线,用 roofline / 带宽模型做瓶颈归因
-- 提出假设 → 隔离实验(微基准 / A-B / 正确性对拍)→ 用数据证伪,而不是提交"看起来对"的改动
-- 诚实区分"我以为能优化"和"测完发现上游是对的"——性能工程里最值钱也最少见的习惯
+- Building and reading the hot path of a large C++/Objective-C/Metal inference engine (decode loop, sampler chain, Metal dispatch, KV cache)
+- Establishing a low-variance, reproducible baseline and attributing the bottleneck with a roofline / bandwidth model
+- Hypothesis → isolated experiment (microbench / A-B / correctness diff) → falsification by data, instead of shipping a change that merely "looks right"
+- Honestly separating "I thought this was optimizable" from "measured it, upstream was right" — the most valuable and least common habit in performance work
 
-## 复现
+## Reproduce
 
-见 [`SETUP.md`](SETUP.md)。基线:`bench/run_bench.sh baseline`;原始数据:[`results/measurements.md`](results/measurements.md);三个实验改动在 [`patches/`](patches/)。
+See [`SETUP.md`](SETUP.md). Baseline: `bench/run_bench.sh baseline`; raw data: [`results/measurements.md`](results/measurements.md); the experiment diffs are in [`patches/`](patches/).
 
 ```
-bench/     基线 / 对比 / 微基准 工具
-results/   原始测量数据(measurements.md + baseline.json)
-patches/   实验改动(h2/h3 为捕获的 git diff;h1 见上文 diff)
-SETUP.md   构建 llama.cpp + 下模型 + 复现步骤
+bench/     baseline / compare / microbench tools
+results/   raw measurements (measurements.md + baseline.json)
+patches/   experiment diffs (h2/h3 captured git diffs; h1 is the diff above)
+SETUP.md   build llama.cpp + download model + reproduction steps
 ```
 
 

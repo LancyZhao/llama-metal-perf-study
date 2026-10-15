@@ -1,7 +1,7 @@
 # Raw measurements
 
 Every number here was measured on the machine below — nothing is estimated.
-These are the evidence behind the findings in the [README](../README.md).
+These back the findings in the [README](../README.md).
 
 ## Environment
 - Apple M2 (8-core: 4P + 4E), 16 GB unified memory, macOS 15.6
@@ -25,10 +25,10 @@ M2's ~100 GB/s**. Single-stream decode is memory-bandwidth bound.
 `n_vocab=151936`, 20000 steps, `clang++ -O3`:
 ```
 full_ramp        ~29000 ns/step   baseline: cur[i] = {i, logit, 0}
-full_cachedid    ~29500 ns/step   full write, id read from array  ≈ baseline
-partial_skipid   ~61000 ns/step   the "de-dup": skip id, write logit+p   → 2.1x SLOWER
-logit_only       ~46000 ns/step   write only logit                       → 1.6x slower
-soa_memcpy        ~9300 ns/step   struct-of-arrays memcpy                → 3.2x faster
+full_cachedid    ~29500 ns/step   full write, id read from array  ~ baseline
+partial_skipid   ~61000 ns/step   the "de-dup": skip id, write logit+p   -> 2.1x SLOWER
+logit_only       ~46000 ns/step   write only logit                       -> 1.6x slower
+soa_memcpy        ~9300 ns/step   struct-of-arrays memcpy                -> 3.2x faster
 ```
 Fill cost ≈ 29 µs vs a decode step ≈ 23 ms → the sampler build is **< 0.2 % of decode**.
 ## H2 — Metal shader compile cold start (`llama-cli` startup wall clock)
@@ -41,7 +41,7 @@ Fill cost ≈ 29 µs vs a decode step ≈ 23 ms → the sampler build is **< 0.2
 
 Greedy output byte-identical with/without the skip. macOS caches compiled
 shaders on disk, so the warm-cache start is ~1.1 s **regardless** — skipping
-unused libraries only helps the one cold compile right after a rebuild.
+unused libraries only helps the single cold compile right after a rebuild.
 
 ## H3 — batched decode throughput — `llama-batched-bench -npp 128 -ntg 64`
 Baseline (`S_TG` = aggregate generation tok/s across `B` parallel sequences):
