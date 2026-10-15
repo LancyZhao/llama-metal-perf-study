@@ -1,0 +1,45 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 13aecbd..bc0e54a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -313,6 +313,26 @@ static bool ggml_metal_library_flatten_file(NSMutableString * dst, NSString * pa
+ // *err set on failure. On success the objs[] slots are populated and the routing
+ // index is built; on any failure every error is logged and false is returned
+ // (the caller is responsible for freeing `res`).
++// comma-separated exact-token membership test (used by GGML_METAL_SKIP_LIBS)
++static bool ggml_metal_name_in_csv(const char * csv, const char * name) {
++    if (!csv || !name) {
++        return false;
++    }
++    const size_t n = strlen(name);
++    for (const char * p = csv; *p; ) {
++        const char * e = strchr(p, ',');
++        const size_t len = e ? (size_t) (e - p) : strlen(p);
++        if (len == n && strncmp(p, name, n) == 0) {
++            return true;
++        }
++        if (!e) {
++            break;
++        }
++        p = e + 1;
++    }
++    return false;
++}
++
+ static bool ggml_metal_library_compile_all(
+         ggml_metal_library_t res,
+         id<MTLDevice> device,
+@@ -333,6 +353,13 @@ static bool ggml_metal_library_compile_all(
+ 
+             const int64_t t0 = ggml_time_us();
+ 
++            // experimental: skip libraries listed in GGML_METAL_SKIP_LIBS so the
++            // cold-start cost of never-used kernel groups can be measured / avoided.
++            if (ggml_metal_name_in_csv(getenv("GGML_METAL_SKIP_LIBS"), k_lib_names[kind])) {
++                t_per_lib[kind] = ggml_time_us() - t0;
++                return; // res->objs[kind] stays nil; unused kernels are never requested
++            }
++
+             NSError * error = nil;
+ 
+             NSString * src = source_for_kind(kind, &error);
