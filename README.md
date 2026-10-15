@@ -90,6 +90,8 @@ Unlike the three dead ends, this one shows *unused* bandwidth. Throughput vs KV 
 
 The slowdown is expected (attention grows with context); the roofline is the interesting part. Short-context decode runs at ~80 GB/s (82 % of peak). At 8K the KV cache adds only ~0.3 GB/token, so a pure-bandwidth model predicts ~36 tok/s — but it measures **32.4**: achieved bandwidth has fallen to **~71 GB/s**. The attention / KV-read path is *not* saturating memory bandwidth the way the weight GEMV does. That gap is the one place in this study with plausible headroom — and it is the regime that matters in practice (long prompts, RAG, chat).
 
+The one config-level lever — KV-cache quantization — makes it **worse**: at d=8192, q8_0/q4_0 KV decode at 27.4 / 27.9 tok/s vs **32.0** for f16 (−14 %). On Metal the quantized KV is dequantized back to F16 before the attention kernel, and that dequant costs more than the bandwidth it saves (KV ≈ 0.3 GB vs 1.9 GB of weights). KV-quant is a *memory* lever here (fit a longer context), not a speed one.
+
 **Honest caveat:** confirming it, and landing a win, needs per-op GPU profiling (unavailable here without the Xcode Metal GPU-capture toolchain) or direct work on the `fa_*` FlashAttention kernels — expert territory, unknown odds. What separates this from the three dead ends: here the data shows bandwidth left on the table, not a hypothesis the data rejected.
 
 ## So where *is* there headroom?

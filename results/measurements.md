@@ -83,3 +83,14 @@ pure 80 GB/s model predicts 80/(1.93+0.30) ≈ **36 t/s** — but it measures **
 i.e. achieved bandwidth fell to ≈ **71 GB/s**. The attention / KV-read path is not
 saturating bandwidth the way the weight GEMV does → the one place with plausible
 headroom. Confirming needs per-op GPU profiling (unavailable here) or `fa_*` kernel work.
+
+### KV-cache quantization at d=8192 (`-fa 1`, -r 3)
+| KV cache | decode tg128 t/s |
+|---|---|
+| f16 | 31.98 ± 0.64 |
+| q8_0 | 27.38 ± 0.52 (−14 %) |
+| q4_0 | 27.85 ± 0.36 (−13 %) |
+
+Quantizing the KV cache is **slower** on Metal: the quantized KV is dequantized to
+F16 before the attention kernel, and that dequant costs more than the bandwidth it
+saves (KV ≈ 0.3 GB vs 1.9 GB of weights). KV-quant saves memory, not time.
